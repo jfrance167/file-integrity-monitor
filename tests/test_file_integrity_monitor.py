@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -96,15 +97,19 @@ class FileIntegrityTests(unittest.TestCase):
         document = {
             "version": monitor.BASELINE_VERSION,
             "algorithm": "sha256",
+            "created_at": "2026-01-01T00:00:00+00:00",
             "root": str(self.root),
             "excludes": [],
             "files": {
                 "file.txt": {
                     "sha256": "bad",
                     "size": 1,
+                    "mtime_ns": 0,
                     "mode": 0o644,
                     "uid": 0,
                     "gid": 0,
+                    "device": 0,
+                    "inode": 0,
                     "kind": "file",
                 }
             },
@@ -133,7 +138,7 @@ class FileIntegrityTests(unittest.TestCase):
         monitor.create_baseline(self.root, self.baseline_path)
         other_root = self.root / "relocated"
         other_root.mkdir()
-        (other_root / "file.txt").write_text("content", encoding="utf-8")
+        shutil.copy2(self.root / "file.txt", other_root / "file.txt")
         comparison = monitor.verify_directory(
             other_root, self.baseline_path, ignore_root=True
         )
@@ -193,20 +198,146 @@ class FileIntegrityTests(unittest.TestCase):
     def test_signed_baseline_requires_key(self) -> None:
         self.write("important.txt", "trusted")
         monitor.create_baseline(
-            self.root, self.baseline_path, hmac_key=b"secret"
+            self.root, self.baseline_path, hmac_key=b"s" * 32
         )
         with self.assertRaisesRegex(ValueError, "supply --key-file"):
             monitor.verify_directory(self.root, self.baseline_path)
 
+    def test_rejects_unrecognized_hmac_metadata(self) -> None:
+        self.write("important.txt", "trusted")
+        key = b"s" * 32
+        monitor.create_baseline(
+            self.root, self.baseline_path, hmac_key=key
+        )
+        document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        document["hmac"]["untrusted"] = "extra"
+        self.baseline_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid HMAC metadata"):
+            monitor.verify_directory(
+                self.root, self.baseline_path, hmac_key=key
+            )
+
     def test_wrong_hmac_key_is_rejected(self) -> None:
         self.write("important.txt", "trusted")
         monitor.create_baseline(
-            self.root, self.baseline_path, hmac_key=b"correct"
+            self.root, self.baseline_path, hmac_key=b"c" * 32
         )
         with self.assertRaisesRegex(ValueError, "HMAC verification failed"):
             monitor.verify_directory(
-                self.root, self.baseline_path, hmac_key=b"incorrect"
+                self.root, self.baseline_path, hmac_key=b"i" * 32
             )
+
+    def test_short_hmac_key_is_rejected(self) -> None:
+        self.write("important.txt", "trusted")
+        with self.assertRaisesRegex(ValueError, "at least 32 bytes"):
+            monitor.create_baseline(
+                self.root, self.baseline_path, hmac_key=b"too-short"
+            )
+
+    def test_rejects_noncanonical_baseline_path(self) -> None:
+        self.write("important.txt", "trusted")
+        monitor.create_baseline(self.root, self.baseline_path)
+        document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        record = document["files"].pop("important.txt")
+        document["files"]["../important.txt"] = record
+        self.baseline_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "non-canonical file path"):
+            monitor.load_baseline(self.baseline_path)
+
+    def test_rejects_unrecognized_record_fields(self) -> None:
+        self.write("important.txt", "trusted")
+        monitor.create_baseline(self.root, self.baseline_path)
+        document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        document["files"]["important.txt"]["unexpected"] = True
+        self.baseline_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid baseline record"):
+            monitor.load_baseline(self.baseline_path)
+
+    def test_rejects_relative_baseline_root(self) -> None:
+        self.write("important.txt", "trusted")
+        monitor.create_baseline(self.root, self.baseline_path)
+        document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        document["root"] = "relative/root"
+        self.baseline_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            monitor.load_baseline(self.baseline_path)
+
+    def test_rejects_invalid_baseline_timestamp(self) -> None:
+        self.write("important.txt", "trusted")
+        monitor.create_baseline(self.root, self.baseline_path)
+        document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        document["created_at"] = "not-a-timestamp"
+        self.baseline_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid baseline metadata"):
+            monitor.load_baseline(self.baseline_path)
+
+    def test_identity_change_is_detected_and_can_be_ignored(self) -> None:
+        before = monitor.FileRecord(
+            sha256="a" * 64,
+            size=4,
+            mtime_ns=123,
+            mode=0o644,
+            uid=1000,
+            gid=1000,
+            device=1,
+            inode=10,
+        )
+        after = monitor.FileRecord(
+            sha256="a" * 64,
+            size=4,
+            mtime_ns=123,
+            mode=0o644,
+            uid=1000,
+            gid=1000,
+            device=1,
+            inode=11,
+        )
+        current = monitor.ScanResult(files={"file.txt": after}, errors={})
+        strict = monitor.compare_records({"file.txt": before}, current)
+        portable = monitor.compare_records(
+            {"file.txt": before}, current, ignore_identity=True
+        )
+        self.assertEqual([item.path for item in strict.modified], ["file.txt"])
+        self.assertEqual(portable.change_count, 0)
+
+    def test_identical_atomic_replacement_is_detected(self) -> None:
+        original = self.write("important.txt", "same content")
+        monitor.create_baseline(self.root, self.baseline_path)
+        replacement = self.write("replacement.tmp", "same content")
+        replacement.chmod(stat.S_IMODE(original.stat().st_mode))
+        os.replace(replacement, original)
+        comparison = monitor.verify_directory(self.root, self.baseline_path)
+        self.assertEqual(
+            [item.path for item in comparison.modified], ["important.txt"]
+        )
+        change = comparison.modified[0]
+        self.assertEqual(change.before_sha256, change.after_sha256)
+        self.assertNotEqual(change.before_inode, change.after_inode)
+
+    def test_timestamp_only_change_is_detected(self) -> None:
+        path = self.write("important.txt", "same content")
+        monitor.create_baseline(self.root, self.baseline_path)
+        original_mtime = path.stat().st_mtime_ns
+        os.utime(path, ns=(original_mtime + 2_000_000_000,) * 2)
+        comparison = monitor.verify_directory(self.root, self.baseline_path)
+        self.assertEqual(
+            [item.path for item in comparison.modified], ["important.txt"]
+        )
+        change = comparison.modified[0]
+        self.assertNotEqual(change.before_mtime_ns, change.after_mtime_ns)
+
+    def test_directory_symlink_is_recorded_without_traversal(self) -> None:
+        target = self.root / "target"
+        target.mkdir()
+        (target / "inside.txt").write_text("content", encoding="utf-8")
+        link = self.root / "link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (NotImplementedError, OSError):
+            self.skipTest("directory symlinks are unavailable")
+        scan = monitor.scan_directory(self.root)
+        self.assertEqual(scan.files["link"].kind, "symlink")
+        self.assertNotIn("link/inside.txt", scan.files)
 
     def test_metadata_is_stored_in_baseline(self) -> None:
         path = self.write("important.txt", "trusted")
@@ -214,9 +345,12 @@ class FileIntegrityTests(unittest.TestCase):
         document = json.loads(self.baseline_path.read_text(encoding="utf-8"))
         record = document["files"]["important.txt"]
         info = path.stat()
+        self.assertEqual(record["mtime_ns"], info.st_mtime_ns)
         self.assertEqual(record["mode"], stat.S_IMODE(info.st_mode))
         self.assertIn("uid", record)
         self.assertIn("gid", record)
+        self.assertEqual(record["device"], info.st_dev)
+        self.assertEqual(record["inode"], info.st_ino)
 
 
 class CommandLineTests(unittest.TestCase):
@@ -226,6 +360,7 @@ class CommandLineTests(unittest.TestCase):
             exit_code = monitor.main(["demo", "--json"])
         document = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
+        self.assertTrue(monitor.valid_aware_timestamp(document["checked_at"]))
         self.assertEqual(document["created"], ["created.txt"])
         self.assertEqual(document["deleted"], ["deleted.txt"])
         self.assertEqual(document["modified"][0]["path"], "modified.txt")
@@ -275,7 +410,7 @@ class CommandLineTests(unittest.TestCase):
         ) as temporary_directory:
             root = Path(temporary_directory)
             key_path = root / "fim.key"
-            key_path.write_bytes(b"secret-key")
+            key_path.write_bytes(b"k" * 32)
             (root / "file.txt").write_text("content", encoding="utf-8")
             with redirect_stdout(StringIO()):
                 exit_code = monitor.main(
@@ -287,6 +422,19 @@ class CommandLineTests(unittest.TestCase):
             )
             self.assertNotIn("fim.key", baseline["files"])
             self.assertIn("hmac", baseline)
+            check_output = StringIO()
+            with redirect_stdout(check_output):
+                check_exit = monitor.main(
+                    [
+                        "check",
+                        str(root),
+                        "--key-file",
+                        str(key_path),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(check_exit, 0)
+            self.assertEqual(json.loads(check_output.getvalue())["change_count"], 0)
 
 
 if __name__ == "__main__":

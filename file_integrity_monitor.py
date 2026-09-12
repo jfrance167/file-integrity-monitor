@@ -15,13 +15,14 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
 
-BASELINE_VERSION = 2
+BASELINE_VERSION = 3
 DEFAULT_BASELINE_NAME = ".fim-baseline.json"
 HASH_CHUNK_SIZE = 1024 * 1024
+MIN_HMAC_KEY_BYTES = 32
 DEFAULT_EXCLUDES = (".git", "__pycache__", "*.pyc")
 
 
@@ -29,9 +30,12 @@ DEFAULT_EXCLUDES = (".git", "__pycache__", "*.pyc")
 class FileRecord:
     sha256: str
     size: int
+    mtime_ns: int
     mode: int
     uid: int
     gid: int
+    device: int
+    inode: int
     kind: str = "file"
 
 
@@ -42,12 +46,18 @@ class ModifiedFile:
     after_sha256: str
     before_size: int
     after_size: int
+    before_mtime_ns: int
+    after_mtime_ns: int
     before_mode: int
     after_mode: int
     before_uid: int
     after_uid: int
     before_gid: int
     after_gid: int
+    before_device: int
+    after_device: int
+    before_inode: int
+    after_inode: int
     before_kind: str
     after_kind: str
 
@@ -68,6 +78,7 @@ class Baseline:
 
 @dataclass(frozen=True)
 class Comparison:
+    checked_at: str
     created: list[str]
     modified: list[ModifiedFile]
     deleted: list[str]
@@ -79,6 +90,7 @@ class Comparison:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "checked_at": self.checked_at,
             "change_count": self.change_count,
             "created": self.created,
             "modified": [asdict(item) for item in self.modified],
@@ -165,8 +177,12 @@ def metadata_from_stat(info: os.stat_result) -> tuple[int, int, int]:
     )
 
 
+def identity_from_stat(info: os.stat_result) -> tuple[int, int]:
+    return (int(info.st_dev), int(info.st_ino))
+
+
 def same_file(left: os.stat_result, right: os.stat_result) -> bool:
-    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+    return identity_from_stat(left) == identity_from_stat(right)
 
 
 def stable_attributes(info: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -211,9 +227,12 @@ def hash_regular_file(path: Path) -> FileRecord:
             return FileRecord(
                 sha256=digest.hexdigest(),
                 size=after.st_size,
+                mtime_ns=after.st_mtime_ns,
                 mode=mode,
                 uid=uid,
                 gid=gid,
+                device=int(after.st_dev),
+                inode=int(after.st_ino),
             )
         if attempt == 0:
             continue
@@ -237,9 +256,12 @@ def hash_symlink(path: Path) -> FileRecord:
             return FileRecord(
                 sha256=digest,
                 size=len(encoded_target),
+                mtime_ns=after.st_mtime_ns,
                 mode=mode,
                 uid=uid,
                 gid=gid,
+                device=int(after.st_dev),
+                inode=int(after.st_ino),
                 kind="symlink",
             )
         if attempt == 0:
@@ -341,9 +363,22 @@ def valid_sha256(value: object) -> bool:
     )
 
 
+def valid_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def valid_aware_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def sign_document(document: dict[str, object], key: bytes) -> None:
-    if not key:
-        raise ValueError("HMAC key must not be empty")
+    validate_hmac_key(key)
     document["hmac"] = {
         "algorithm": "hmac-sha256",
         "digest": hmac.new(key, canonical_json(document), hashlib.sha256).hexdigest(),
@@ -351,14 +386,15 @@ def sign_document(document: dict[str, object], key: bytes) -> None:
 
 
 def verify_document_signature(document: dict[str, object], key: bytes | None) -> bool:
-    signature = document.get("hmac")
-    if signature is None:
+    if "hmac" not in document:
         if key is not None:
             raise ValueError("an HMAC key was supplied, but the baseline is unsigned")
         return False
+    signature = document["hmac"]
     if key is None:
         raise ValueError("baseline is HMAC-signed; supply --key-file to verify it")
-    if not isinstance(signature, dict):
+    validate_hmac_key(key)
+    if not isinstance(signature, dict) or set(signature) != {"algorithm", "digest"}:
         raise ValueError("invalid HMAC metadata in baseline")
     algorithm = signature.get("algorithm")
     digest = signature.get("digest")
@@ -368,6 +404,25 @@ def verify_document_signature(document: dict[str, object], key: bytes | None) ->
     if not hmac.compare_digest(digest, expected):
         raise ValueError("baseline HMAC verification failed")
     return True
+
+
+def validate_hmac_key(key: bytes) -> None:
+    if len(key) < MIN_HMAC_KEY_BYTES:
+        raise ValueError(
+            f"HMAC key must contain at least {MIN_HMAC_KEY_BYTES} bytes"
+        )
+
+
+def validate_record_path(relative: str) -> None:
+    candidate = PurePosixPath(relative)
+    if (
+        not relative
+        or "\\" in relative
+        or candidate.is_absolute()
+        or relative != candidate.as_posix()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise ValueError(f"invalid non-canonical file path in baseline: {relative!r}")
 
 
 def atomic_write_json(path: Path, document: dict[str, object]) -> None:
@@ -424,51 +479,127 @@ def load_baseline(path: Path, hmac_key: bytes | None = None) -> Baseline:
 
     if not isinstance(document, dict) or document.get("version") != BASELINE_VERSION:
         raise ValueError(f"unsupported or missing baseline version in {path}")
+    required_fields = {
+        "version",
+        "algorithm",
+        "created_at",
+        "root",
+        "excludes",
+        "files",
+    }
+    allowed_fields = required_fields | {"hmac"}
+    if not required_fields.issubset(document) or not set(document).issubset(
+        allowed_fields
+    ):
+        raise ValueError(f"invalid baseline structure in {path}")
     signed = verify_document_signature(document, hmac_key)
     if document.get("algorithm") != "sha256" or not isinstance(
         document.get("files"), dict
     ):
         raise ValueError(f"invalid baseline structure in {path}")
     root_value = document.get("root")
+    created_at_value = document.get("created_at")
     excludes_value = document.get("excludes", [])
-    if not isinstance(root_value, str) or not isinstance(excludes_value, list) or not all(
-        isinstance(item, str) for item in excludes_value
+    if (
+        not isinstance(root_value, str)
+        or not valid_aware_timestamp(created_at_value)
+        or not isinstance(excludes_value, list)
+        or not all(isinstance(item, str) for item in excludes_value)
     ):
         raise ValueError(f"invalid baseline metadata in {path}")
+    baseline_root = Path(root_value).expanduser()
+    if not baseline_root.is_absolute():
+        raise ValueError(f"baseline root must be an absolute path in {path}")
 
     records: dict[str, FileRecord] = {}
+    normalized_paths: set[str] = set()
     for relative, value in document["files"].items():
         if not isinstance(relative, str) or not isinstance(value, dict):
             raise ValueError(f"invalid file record in baseline {path}")
+        record_fields = {
+            "sha256",
+            "size",
+            "mtime_ns",
+            "mode",
+            "uid",
+            "gid",
+            "device",
+            "inode",
+            "kind",
+        }
+        if set(value) != record_fields:
+            raise ValueError(f"invalid baseline record for {relative!r}")
+        validate_record_path(relative)
+        normalized = os.path.normcase(relative)
+        if normalized in normalized_paths:
+            raise ValueError(f"duplicate filesystem path in baseline: {relative!r}")
+        normalized_paths.add(normalized)
         digest = value.get("sha256")
         size = value.get("size")
+        mtime_ns = value.get("mtime_ns")
         mode = value.get("mode")
         uid = value.get("uid")
         gid = value.get("gid")
-        kind = value.get("kind", "file")
+        device = value.get("device")
+        inode = value.get("inode")
+        kind = value.get("kind")
         if (
             not valid_sha256(digest)
-            or not isinstance(size, int)
-            or size < 0
-            or not isinstance(mode, int)
-            or mode < 0
-            or not isinstance(uid, int)
-            or uid < 0
-            or not isinstance(gid, int)
-            or gid < 0
+            or not valid_nonnegative_int(size)
+            or type(mtime_ns) is not int
+            or not valid_nonnegative_int(mode)
+            or mode > 0o7777
+            or not valid_nonnegative_int(uid)
+            or not valid_nonnegative_int(gid)
+            or not valid_nonnegative_int(device)
+            or not valid_nonnegative_int(inode)
             or kind not in {"file", "symlink"}
         ):
             raise ValueError(f"invalid baseline record for {relative!r}")
         records[relative] = FileRecord(
-            sha256=digest, size=size, mode=mode, uid=uid, gid=gid, kind=kind
+            sha256=digest,
+            size=size,
+            mtime_ns=mtime_ns,
+            mode=mode,
+            uid=uid,
+            gid=gid,
+            device=device,
+            inode=inode,
+            kind=kind,
         )
     return Baseline(
-        root=Path(root_value), excludes=excludes_value, files=records, signed=signed
+        root=baseline_root, excludes=excludes_value, files=records, signed=signed
     )
 
 
+def records_match(
+    before: FileRecord, after: FileRecord, ignore_identity: bool
+) -> bool:
+    if ignore_identity:
+        return (
+            before.sha256,
+            before.size,
+            before.mtime_ns,
+            before.mode,
+            before.uid,
+            before.gid,
+            before.kind,
+        ) == (
+            after.sha256,
+            after.size,
+            after.mtime_ns,
+            after.mode,
+            after.uid,
+            after.gid,
+            after.kind,
+        )
+    return before == after
+
+
 def compare_records(
-    baseline: dict[str, FileRecord], current: ScanResult
+    baseline: dict[str, FileRecord],
+    current: ScanResult,
+    ignore_identity: bool = False,
 ) -> Comparison:
     baseline_paths = set(baseline)
     current_paths = set(current.files)
@@ -478,7 +609,7 @@ def compare_records(
     for path in sorted(baseline_paths & current_paths):
         before = baseline[path]
         after = current.files[path]
-        if before != after:
+        if not records_match(before, after, ignore_identity=ignore_identity):
             modified.append(
                 ModifiedFile(
                     path=path,
@@ -486,17 +617,24 @@ def compare_records(
                     after_sha256=after.sha256,
                     before_size=before.size,
                     after_size=after.size,
+                    before_mtime_ns=before.mtime_ns,
+                    after_mtime_ns=after.mtime_ns,
                     before_mode=before.mode,
                     after_mode=after.mode,
                     before_uid=before.uid,
                     after_uid=after.uid,
                     before_gid=before.gid,
                     after_gid=after.gid,
+                    before_device=before.device,
+                    after_device=after.device,
+                    before_inode=before.inode,
+                    after_inode=after.inode,
                     before_kind=before.kind,
                     after_kind=after.kind,
                 )
             )
     return Comparison(
+        checked_at=utc_now(),
         created=created,
         modified=modified,
         deleted=deleted,
@@ -509,6 +647,7 @@ def verify_directory(
     baseline_path: Path,
     excludes: Sequence[str] = (),
     ignore_root: bool = False,
+    ignore_identity: bool = False,
     hmac_key: bytes | None = None,
     key_path: Path | None = None,
 ) -> Comparison:
@@ -527,18 +666,46 @@ def verify_directory(
     current = scan_directory(
         root, excludes=effective_excludes, protected_paths=protected_paths
     )
-    return compare_records(baseline.files, current)
+    return compare_records(
+        baseline.files,
+        current,
+        ignore_identity=ignore_root or ignore_identity,
+    )
+
+
+def modification_reasons(item: ModifiedFile) -> list[str]:
+    reasons: list[str] = []
+    if item.before_sha256 != item.after_sha256:
+        reasons.append("content")
+    if item.before_size != item.after_size:
+        reasons.append("size")
+    if item.before_mtime_ns != item.after_mtime_ns:
+        reasons.append("mtime")
+    if item.before_mode != item.after_mode:
+        reasons.append("permissions")
+    if (item.before_uid, item.before_gid) != (item.after_uid, item.after_gid):
+        reasons.append("owner")
+    if (item.before_device, item.before_inode) != (
+        item.after_device,
+        item.after_inode,
+    ):
+        reasons.append("identity")
+    if item.before_kind != item.after_kind:
+        reasons.append("type")
+    return reasons
 
 
 def print_comparison(comparison: Comparison) -> None:
     print("File Integrity Monitor")
+    print(f"Checked at:       {comparison.checked_at}")
     print(f"Changes detected: {comparison.change_count}")
     print(f"Scan errors:      {len(comparison.errors)}")
     print("-" * 64)
     for path in comparison.created:
         print(f"[CREATED]  {path}")
     for item in comparison.modified:
-        print(f"[MODIFIED] {item.path}")
+        reasons = ", ".join(modification_reasons(item))
+        print(f"[MODIFIED] {item.path} ({reasons})")
     for path in comparison.deleted:
         print(f"[DELETED]  {path}")
     for path, message in sorted(comparison.errors.items()):
@@ -552,8 +719,10 @@ def read_key_file(path: Path) -> bytes:
         key = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"could not read HMAC key file {path}: {exc}") from exc
-    if not key:
-        raise ValueError(f"HMAC key file is empty: {path}")
+    try:
+        validate_hmac_key(key)
+    except ValueError as exc:
+        raise ValueError(f"invalid HMAC key file {path}: {exc}") from exc
     return key
 
 
@@ -628,6 +797,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="verify an intentional copy or relocated mount of the baseline root",
     )
+    check_parser.add_argument(
+        "--ignore-identity",
+        action="store_true",
+        help="ignore device and inode changes while checking all other fields",
+    )
     demo_parser = subparsers.add_parser(
         "demo", help="prove detection using temporary files"
     )
@@ -663,6 +837,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             baseline_path,
             excludes=args.exclude,
             ignore_root=args.ignore_root,
+            ignore_identity=args.ignore_identity,
             hmac_key=hmac_key,
             key_path=key_path,
         )

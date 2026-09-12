@@ -8,7 +8,8 @@ Use it only on directories and systems you own or are authorized to monitor.
 
 ## What it does
 
-- Recursively records SHA-256, size, file type, permissions, owner UID, and GID
+- Recursively records SHA-256, size, modification time, file type, permissions,
+  owner UID/GID, and filesystem identity
 - Detects created, modified, and deleted paths
 - Detects content or metadata changes even when file size stays the same
 - Records symbolic-link targets without following them outside the monitored tree
@@ -19,6 +20,7 @@ Use it only on directories and systems you own or are authorized to monitor.
 - Writes baselines atomically and refuses accidental overwrites
 - Optionally authenticates baselines with HMAC-SHA-256
 - Supports intentional relocation and offline-image analysis with `--ignore-root`
+- Reports check timestamps and the exact reasons each file was marked modified
 - Produces human-readable or JSON reports and automation-friendly exit codes
 - Includes an end-to-end demonstration and automated test suite
 
@@ -74,8 +76,9 @@ python file_integrity_monitor.py check C:\Path\To\Folder `
 ```
 
 Never commit the key or store it beside the baseline with the same access
-permissions. A signed baseline cannot be checked without its key. Any JSON
-tampering causes verification to fail before files are compared.
+permissions. A signed baseline cannot be checked without its key. Any change to
+the signed baseline data causes verification to fail before files are compared;
+formatting-only changes remain valid. Keys shorter than 32 bytes are rejected.
 
 ## Exclusions and relocated roots
 
@@ -98,6 +101,15 @@ python file_integrity_monitor.py check D:\MountedImage `
   --baseline C:\Baselines\important-files.json `
   --ignore-root
 ```
+
+`--ignore-root` also ignores device and inode differences caused by relocation;
+content and the remaining metadata are still checked.
+
+To keep the original root check but ignore device/inode changes on a filesystem
+with unstable file identities, use `--ignore-identity`.
+
+Baseline format version 3 records filesystem identity and modification times.
+Older baseline versions are deliberately rejected and must be recreated.
 
 ## Automation
 
