@@ -6,6 +6,15 @@ with the Python standard library.
 
 Use it only on directories and systems you own or are authorized to monitor.
 
+## Security Notice
+
+This repository is an educational defensive-security lab, not a production
+endpoint-security product. Use it only on systems you own or are authorized to
+monitor. Protect HMAC keys outside the monitored directory and repository, and
+do not treat a clean result as proof that a system is uncompromised.
+
+Do not deploy this project in production.
+
 ## What it does
 
 - Recursively records SHA-256, size, modification time, file type, permissions,

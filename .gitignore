@@ -7,3 +7,10 @@ venv/
 *.key
 fim-demo-*/
 fim-test-*/
+.private/
+.env
+.env.*
+!.env.example
+*.pem
+id_rsa*
+id_ed25519*
