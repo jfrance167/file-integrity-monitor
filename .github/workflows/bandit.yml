@@ -1,0 +1,30 @@
+name: "Bandit Security Scanner"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  bandit-scan:
+    name: Run Bandit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: python -m pip install --disable-pip-version-check bandit
+
+      - name: Run Bandit Scan
+        run: bandit -r . -ll -ii --exclude ./.git,./.venv,./venv
