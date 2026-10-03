@@ -147,3 +147,17 @@ GitHub Actions runs the suite on Python 3.10 and 3.13.
 - Extended attributes and alternate data streams are not monitored.
 - Matching records do not establish who changed a file or why.
 - This is a point-in-time learning tool, not an enterprise endpoint platform.
+
+## Repository map
+
+```text
+file-integrity-monitor/
+|-- .github/
+|-- .gitignore
+|-- README.md
+|-- SECURITY.md
+|-- file_integrity_monitor.py
+`-- tests/
+```
+
+Follow the setup and safety boundaries above before running or deploying any code.
